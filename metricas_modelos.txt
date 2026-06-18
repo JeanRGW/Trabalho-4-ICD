@@ -1,0 +1,118 @@
+
+=== Preparacao - Dados por caso (2026-06-17 23:52:31) ===
+Total bruto no MySQL: 17409641
+Amostra SQL carregada: 120000
+Limite de positivos na amostra: 30000
+Limite de negativos na amostra: 90000
+Total inicial de registros: 120000
+Removidos por alvo ausente (hospitaliz invalido): 0
+Removidos por features NaN: 596
+Dataset final: 119404 registros
+Proporcao da classe positiva (hospitalizado): 0.2500
+Features numericas: ['idade_anos', 'dias_ate_notificacao']
+Features categoricas: ['cs_sexo', 'cs_raca', 'cs_escol_n', 'sg_uf', 'cs_gestant']
+Features binarias (sintomas): ['febre', 'mialgia', 'cefaleia', 'exantema', 'vomito', 'nausea', 'dor_costas', 'conjuntvit', 'artrite', 'artralgia', 'petequia_n', 'leucopenia', 'laco', 'dor_retro']
+Features binarias (comorbidades): ['diabetes', 'hematolog', 'hepatopat', 'renal', 'hipertensa', 'acido_pept', 'auto_imune']
+UF usada nos modelos: sg_uf (residencia do paciente)
+
+
+=== Preparacao - Agregado mensal (2026-06-17 23:53:28) ===
+Registros totais (agregado mensal/UF): 3075
+Colunas do agregado: ['ano', 'mes', 'sg_uf', 'total_casos', 'idade_media', 'pct_febre', 'pct_mialgia', 'pct_cefaleia', 'pct_vomito', 'pct_nausea', 'pct_hospitaliz', 'casos_com_febre', 'periodo', 'mes_indice']
+Agregado calculado diretamente no MySQL para evitar carregar todos os casos em memoria.
+
+
+=== KNN (2026-06-17 23:53:45) ===
+Total de registros brutos do MySQL: 17409641
+Amostra de classificacao carregada: 120000
+Treino: 83582 | Teste: 35822
+Melhor k: 5
+Melhor weights: distance
+Melhor F1 (CV): 0.3500
+Acuracia (teste): 0.7392
+Precisao (teste): 0.4655
+Recall (teste): 0.2942
+F1-score (teste): 0.3605
+AUC (teste): 0.6747
+Matriz de confusao:
+[[23844  3024]
+ [ 6320  2634]]
+Visualizacoes geograficas KNN:
+  graficos/knn_previsao_por_regiao.png
+  graficos/knn_mapa_brasil_taxa_prevista.png
+  graficos/knn_mapa_brasil_erro_abs.png
+Top 5 UFs por taxa prevista KNN:
+uf  total_registros  taxa_real  taxa_prevista_knn  erro_abs
+SE              141   0.815603           0.439716  0.375887
+PB              223   0.470852           0.269058  0.201794
+RS              300   0.420000           0.243333  0.176667
+DF              491   0.389002           0.240326  0.148676
+RN              204   0.460784           0.240196  0.220588
+Top 5 UFs por erro absoluto:
+uf  total_registros  taxa_real  taxa_prevista_knn  erro_abs
+SE              141   0.815603           0.439716  0.375887
+PI              328   0.560976           0.222561  0.338415
+RR              177   0.485876           0.225989  0.259887
+MA              555   0.412613           0.165766  0.246847
+RN              204   0.460784           0.240196  0.220588
+Resumo por regiao:
+      regiao  total_registros  taxa_real  taxa_prevista_knn  erro_abs
+       Norte             4771   0.229512           0.155104  0.074408
+    Nordeste             7413   0.246729           0.139485  0.107244
+Centro-Oeste             7112   0.292463           0.193616  0.098847
+     Sudeste            13295   0.227905           0.146596  0.081309
+         Sul             3231   0.284742           0.172702  0.112040
+
+
+=== Regressao Logistica (2026-06-17 23:53:48) ===
+Total de registros brutos do MySQL: 17409641
+Amostra de classificacao carregada: 120000
+Treino: 83582 | Teste: 35822
+Modelo: LogisticRegression(max_iter=1000, class_weight=balanced)
+Acuracia: 0.6844
+Precisao: 0.4138
+Recall: 0.6301
+F1-score: 0.4995
+AUC: 0.7257
+Matriz de confusao:
+[[18875  7993]
+ [ 3312  5642]]
+
+
+=== Regressao Linear Simples (2026-06-17 23:53:48) ===
+Total de registros brutos do MySQL: 17409641
+Amostra de classificacao carregada: 120000
+Registros totais (agregado): 3075
+Removidos por NaN em features/alvo: 0
+Treino: 2152 | Teste: 923
+Modelo: y = total_casos ~ mes_indice
+Intercepto: 2509.4314
+Coeficiente (mes_indice): 45.5547
+R2 (teste): 0.0018
+MAE (teste): 8591.8772
+RMSE (teste): 38357.7163
+
+
+=== Regressao Linear Multipla (2026-06-17 23:53:48) ===
+Total de registros brutos do MySQL: 17409641
+Amostra de classificacao carregada: 120000
+Registros totais (agregado): 3075
+Removidos por NaN em features/alvo: 5
+Treino: 2149 | Teste: 921
+Features: ['idade_media', 'pct_febre', 'pct_mialgia', 'pct_cefaleia', 'pct_vomito', 'pct_nausea', 'pct_hospitaliz', 'sg_uf', 'mes']
+Modelos: LinearRegression e Ridge(alpha=1.0)
+R2 OLS (teste): 0.1701
+R2 ajustado OLS: 0.1264
+MAE OLS: 8153.9151
+RMSE OLS: 30811.2140
+R2 Ridge (teste): 0.1693
+
+
+=== Comparativo Classificacao (KNN x Logistica) (2026-06-17 23:53:48) ===
+             modelo  acuracia  precisao   recall       f1      auc
+KNN (k=5, distance)  0.739155  0.465536 0.294170 0.360526 0.674715
+Regressao Logistica  0.684412  0.413788 0.630109 0.499535 0.725723
+Vencedor geral (F1): Regressao Logistica
+Vencedor recall (sensibilidade): Regressao Logistica
+Vencedor precisao: KNN (k=5, distance)
+

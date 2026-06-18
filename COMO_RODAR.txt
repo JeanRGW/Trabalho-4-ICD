@@ -1,0 +1,11 @@
+COMO RODAR (ESSENCIAL)
+1) Criar venv: python -m venv .venv
+2) Ativar venv: .venv\Scripts\activate
+3) Instalar dependencias: pip install -r requirements.txt
+4) Rodar fluxo completo: python main.py
+
+AUTOMATIZANDO
+1) Rodar passos anteriores 1-3
+2) Navegar até scripts (cd scripts)
+3) CRON (Linux): chmod +x run_monitor_daily.sh setup_cron_24h.sh ; ./setup_cron_24h.sh
+4) TASK SCHEDULER (Windows): powershell -ExecutionPolicy Bypass -File .\setup_task_scheduler_24h.ps1
