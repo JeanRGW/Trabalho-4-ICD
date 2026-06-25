@@ -20,7 +20,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from config import close_connection, get_connection
+from config import ALLOWED_DATA_YEARS, close_connection, get_connection
 from helpers import (
     UF_CODE_TO_SIGLA, UF_TO_REGION, clean_binary_code, convert_age_to_years,
     normalize_uf,
@@ -35,6 +35,9 @@ CASE_SAMPLE_NEGATIVE_LIMIT = 90_000
 
 NUMERIC_FEATURES = ['idade_anos', 'dias_ate_notificacao']
 CATEGORICAL_FEATURES = ['cs_sexo', 'cs_raca', 'cs_escol_n', 'sg_uf', 'cs_gestant']
+REGRESSION_CATEGORICAL_FEATURES = ['cs_sexo', 'cs_raca', 'cs_escol_n', 'sg_uf', 'sg_uf_not', 'mes']
+REGRESSION_CALENDAR_FEATURES = ['dia_semana_sintomas', 'fim_de_semana_sintomas', 'mes_sin', 'mes_cos']
+REGRESSION_BINARY_FEATURES = ['febre', 'mialgia', 'cefaleia', 'vomito', 'nausea', 'diabetes', 'renal', 'hipertensa']
 BINARY_SYMPTOMS = [
     'febre', 'mialgia', 'cefaleia', 'exantema', 'vomito', 'nausea',
     'dor_costas', 'conjuntvit', 'artrite', 'artralgia',
@@ -54,6 +57,11 @@ BRAZIL_STATES_GEOJSON_URL = (
 REGION_ORDER = ['Norte', 'Nordeste', 'Centro-Oeste', 'Sudeste', 'Sul']
 
 
+def _year_filter_sql(column='dt_notific'):
+    placeholders = ', '.join(['%s'] * len(ALLOWED_DATA_YEARS))
+    return f'YEAR({column}) IN ({placeholders})', tuple(ALLOWED_DATA_YEARS)
+
+
 def _log_metrics(block_title, lines):
     METRICAS_FILE.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -68,6 +76,11 @@ def _save_figure(fig, name):
     GRAFICOS_DIR.mkdir(parents=True, exist_ok=True)
     fig.savefig(GRAFICOS_DIR / name, dpi=150, bbox_inches='tight')
     plt.close(fig)
+
+
+def _save_csv(df, name):
+    GRAFICOS_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(GRAFICOS_DIR / name, index=False, sep=';')
 
 
 def _to_dense_if_needed(matrix):
@@ -91,10 +104,12 @@ def fetch_total_record_count():
     connection = get_connection()
     if not connection:
         raise RuntimeError('Nao foi possivel conectar ao MySQL para contar registros.')
+    year_filter, year_params = _year_filter_sql()
     try:
         df = _run_query(
             connection,
-            'SELECT COUNT(*) AS n FROM casos_dengue WHERE dt_notific IS NOT NULL',
+            f'SELECT COUNT(*) AS n FROM casos_dengue WHERE dt_notific IS NOT NULL AND {year_filter}',
+            year_params,
         )
         return int(df['n'].iloc[0])
     finally:
@@ -110,29 +125,31 @@ def fetch_case_modeling_dataframe_sampled(
         raise RuntimeError('Nao foi possivel conectar ao MySQL para carregar amostra de classificacao.')
 
     select_cols = '''
-        dt_notific, dt_sin_pri, sg_uf, cs_sexo, cs_gestant, cs_raca, cs_escol_n,
+        dt_notific, dt_sin_pri, sem_not, sg_uf_not, sg_uf, cs_sexo, cs_gestant, cs_raca, cs_escol_n,
         nu_idade_n, febre, mialgia, cefaleia, exantema, vomito, nausea,
         dor_costas, conjuntvit, artrite, artralgia, petequia_n, leucopenia,
         laco, dor_retro, diabetes, hematolog, hepatopat, renal, hipertensa,
         acido_pept, auto_imune, hospitaliz
     '''
+    year_filter, year_params = _year_filter_sql()
     query = f'''
         SELECT * FROM (
             SELECT {select_cols}
             FROM casos_dengue
-            WHERE dt_notific IS NOT NULL AND hospitaliz = '1'
+            WHERE dt_notific IS NOT NULL AND {year_filter} AND hospitaliz = '1'
             LIMIT %s
         ) positivos
         UNION ALL
         SELECT * FROM (
             SELECT {select_cols}
             FROM casos_dengue
-            WHERE dt_notific IS NOT NULL AND hospitaliz = '2'
+            WHERE dt_notific IS NOT NULL AND {year_filter} AND hospitaliz = '2'
             LIMIT %s
         ) negativos
     '''
     try:
-        return _run_query(connection, query, (positive_limit, negative_limit))
+        params = (*year_params, positive_limit, *year_params, negative_limit)
+        return _run_query(connection, query, params)
     finally:
         close_connection(connection)
 
@@ -157,6 +174,7 @@ def fetch_monthly_aggregate_dataframe():
     def pct_expr(col):
         return f"AVG(CASE WHEN {col} = '1' THEN 1 WHEN {col} = '2' THEN 0 ELSE NULL END) * 100"
 
+    year_filter, year_params = _year_filter_sql()
     query = f'''
         SELECT
             YEAR(dt_notific) AS ano,
@@ -172,13 +190,13 @@ def fetch_monthly_aggregate_dataframe():
             {pct_expr('hospitaliz')} AS pct_hospitaliz,
             SUM(CASE WHEN febre = '1' THEN 1 ELSE 0 END) AS casos_com_febre
         FROM casos_dengue
-        WHERE dt_notific IS NOT NULL
+        WHERE dt_notific IS NOT NULL AND {year_filter}
         GROUP BY YEAR(dt_notific), MONTH(dt_notific), COALESCE(sg_uf, 'IGN')
         ORDER BY ano, mes, sg_uf
     '''
 
     try:
-        df = _run_query(connection, query)
+        df = _run_query(connection, query, year_params)
         if not df.empty:
             numeric_cols = [
                 'ano', 'mes', 'total_casos', 'idade_media', 'pct_febre', 'pct_mialgia',
@@ -210,17 +228,24 @@ def prepare_case_level_data(df_raw):
     ] = np.nan
 
     df['idade_anos'] = df['nu_idade_n'].apply(convert_age_to_years)
+    df['mes'] = df['dt_notific'].dt.month.astype('Int64').astype(str)
+    df['dia_semana_sintomas'] = df['dt_sin_pri'].dt.dayofweek
+    df['fim_de_semana_sintomas'] = df['dia_semana_sintomas'].isin([5, 6]).astype(int)
+    df['mes_sin'] = np.sin(2 * np.pi * df['dt_notific'].dt.month / 12)
+    df['mes_cos'] = np.cos(2 * np.pi * df['dt_notific'].dt.month / 12)
+
     for col in BINARY_FEATURES:
         df[col] = df[col].apply(clean_binary_code)
-    for col in CATEGORICAL_FEATURES:
+    for col in CATEGORICAL_FEATURES + ['sg_uf_not']:
         df[col] = df[col].fillna('IGN').astype(str)
 
-    df_features = df[ALL_FEATURES + ['hospitaliz_num']]
+    extra_cols = ['sg_uf_not', 'sem_not', 'mes', *REGRESSION_CALENDAR_FEATURES]
+    df_features = df[ALL_FEATURES + extra_cols + ['hospitaliz_num']]
     df_clean = df_features.dropna()
     removidos_features = len(df_features) - len(df_clean)
 
     y = df_clean['hospitaliz_num'].astype(int).values
-    X = df_clean[ALL_FEATURES].copy()
+    X = df_clean[ALL_FEATURES + extra_cols + ['hospitaliz_num']].copy()
 
     proporcao_positivo = float(y.mean()) if len(y) else 0.0
     log_lines = [
@@ -551,6 +576,26 @@ def run_logistic_regression_model(X, y, dataset_info):
 
     print(f'  Acuracia={m["acc"]:.4f}  Precisao={m["prec"]:.4f}  Recall={m["rec"]:.4f}  F1={m["f1"]:.4f}  AUC={m["auc"]:.4f}')
 
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.scatter(
+        y_proba[y_test == 0], np.zeros(np.sum(y_test == 0)),
+        alpha=0.4, label='Nao hospitalizado', color='steelblue', s=12,
+    )
+    ax.scatter(
+        y_proba[y_test == 1], np.ones(np.sum(y_test == 1)),
+        alpha=0.4, label='Hospitalizado', color='indianred', s=12,
+    )
+    ax.axvline(0.5, color='red', linestyle='--', linewidth=2, label='Fronteira de decisao (0.5)')
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(['Nao hospitalizado', 'Hospitalizado'])
+    ax.set_xlabel('Probabilidade prevista de hospitalizacao')
+    ax.set_ylabel('Classe real')
+    ax.set_title('Fronteira de decisao - Regressao Logistica')
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    _save_figure(fig, 'logistica_fronteira_decisao.png')
+
     fig, ax = plt.subplots(figsize=(7, 6))
     sns.heatmap(
         cm, annot=True, fmt='d', cmap='Greens',
@@ -587,10 +632,63 @@ def run_logistic_regression_model(X, y, dataset_info):
     plt.tight_layout()
     _save_figure(fig, 'logistica_probabilidades.png')
 
+    n_plot = min(300, len(y_test))
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(np.arange(n_plot), y_test[:n_plot], marker='o', linestyle='', alpha=0.6, label='Real')
+    ax.plot(np.arange(n_plot), y_pred[:n_plot], marker='s', linestyle='', alpha=0.6, label='Previsto')
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(['Nao hospitalizado', 'Hospitalizado'])
+    ax.set_xlabel('Amostra do conjunto de teste')
+    ax.set_ylabel('Classe')
+    ax.set_title('Regressao Logistica: Real vs Previsto')
+    ax.legend()
+    ax.grid(True, axis='y', linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    _save_figure(fig, 'regressao_logistica_real_vs_previsto.png')
+
+    z = np.linspace(-10, 10, 300)
+    sigmoide = 1 / (1 + np.exp(-z))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(z, sigmoide, linewidth=2)
+    ax.axhline(0.5, linestyle='--', label='Probabilidade = 0.5')
+    ax.axvline(0, linestyle='--', label='Fronteira: beta.x = 0')
+    ax.set_title('Curva S da funcao logistica')
+    ax.set_xlabel('Entrada linear z = beta.x')
+    ax.set_ylabel('Probabilidade prevista')
+    ax.set_ylim(0, 1)
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    _save_figure(fig, 'logistica_curva_sigmoide.png')
+
+    metricas_df = pd.DataFrame({
+        'Metrica': ['Acuracia', 'Precisao', 'Recall', 'F1-score', 'AUC'],
+        'Valor': [m['acc'], m['prec'], m['rec'], m['f1'], m['auc']],
+    })
+    _save_csv(metricas_df, 'metricas_regressao_logistica.csv')
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(metricas_df['Metrica'], metricas_df['Valor'], color='seagreen')
+    ax.set_ylim(0, 1)
+    ax.set_title('Metricas da Regressao Logistica')
+    ax.set_ylabel('Valor')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    _save_figure(fig, 'logistica_metricas.png')
+
+    predicoes = X_test.copy()
+    predicoes['Classe_Real'] = y_test
+    predicoes['Classe_Prevista'] = y_pred
+    predicoes['Probabilidade_Hospitalizacao'] = y_proba
+    _save_csv(predicoes, 'predicoes_regressao_logistica.csv')
+
     try:
         feature_names = pipe.named_steps['pre'].get_feature_names_out()
         coefs = pipe.named_steps['lr'].coef_[0]
-        top = pd.DataFrame({'feature': feature_names, 'coef': coefs})
+        coeficientes = pd.DataFrame({'Variavel': feature_names, 'Coeficiente': coefs})
+        _save_csv(coeficientes.sort_values('Coeficiente', key=abs, ascending=False), 'coeficientes_regressao_logistica.csv')
+
+        top = coeficientes.rename(columns={'Variavel': 'feature', 'Coeficiente': 'coef'})
         top['abs_coef'] = top['coef'].abs()
         top = top.sort_values('abs_coef', ascending=False).head(15).sort_values('coef')
 
@@ -623,15 +721,19 @@ def run_logistic_regression_model(X, y, dataset_info):
     }
 
 
-def run_simple_linear_regression(df_agg, dataset_info):
+def run_simple_linear_regression(X_cases, dataset_info):
     print('\n[Regressao Linear Simples] Iniciando treinamento...')
 
-    cols_needed = ['total_casos', 'mes_indice']
-    df_clean = df_agg.dropna(subset=cols_needed).copy()
-    removidos = len(df_agg) - len(df_clean)
+    cols_needed = ['idade_anos', 'dias_ate_notificacao']
+    df_clean = X_cases.dropna(subset=cols_needed).copy()
+    df_clean = df_clean[
+        (df_clean['dias_ate_notificacao'] >= 0) &
+        (df_clean['dias_ate_notificacao'] <= 60)
+    ].copy()
+    removidos = len(X_cases) - len(df_clean)
 
-    X = df_clean[['mes_indice']].values
-    y = df_clean['total_casos'].values
+    X = df_clean[['idade_anos']].values
+    y = df_clean['dias_ate_notificacao'].values
 
     X_train, X_test, y_train, y_test = _split_regression(X, y)
 
@@ -644,20 +746,32 @@ def run_simple_linear_regression(df_agg, dataset_info):
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 
     print(f'  R2={r2:.4f}  MAE={mae:.2f}  RMSE={rmse:.2f}')
-    print(f'  Intercepto={model.intercept_:.2f}  Coef={model.coef_[0]:.4f}')
+    print(f'  Intercepto={model.intercept_:.2f}  Coef idade={model.coef_[0]:.4f}')
 
     fig, ax = plt.subplots(figsize=(9, 6))
     ax.scatter(X_train[:, 0], y_train, alpha=0.4, label='Treino', color='steelblue')
     ax.scatter(X_test[:, 0], y_test, alpha=0.4, label='Teste', color='indianred')
     xs = np.linspace(X[:, 0].min(), X[:, 0].max(), 100).reshape(-1, 1)
     ax.plot(xs, model.predict(xs), color='black', lw=2, label='Regressao')
-    ax.set_xlabel('Indice temporal do mes/UF')
-    ax.set_ylabel('Total de casos no mes/UF')
-    ax.set_title(f'Regressao Linear Simples (R2={r2:.3f})')
+    ax.set_xlabel('Idade (anos)')
+    ax.set_ylabel('Dias ate notificacao')
+    ax.set_title(f'Idade vs atraso de notificacao (R2={r2:.3f})')
     ax.legend()
     ax.grid(alpha=0.3)
     plt.tight_layout()
     _save_figure(fig, 'regressao_linear_simples.png')
+
+    df_pred = pd.DataFrame({'real': y_test, 'previsto': y_pred}).sort_values('real').reset_index(drop=True)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(df_pred.index, df_pred['real'], marker='o', label='Real', linewidth=1)
+    ax.plot(df_pred.index, df_pred['previsto'], marker='s', label='Previsto', linewidth=1)
+    ax.set_title('Atraso de notificacao: valores reais e previstos (regressao simples)')
+    ax.set_xlabel('Casos de teste ordenados pelo atraso real')
+    ax.set_ylabel('Dias ate notificacao')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save_figure(fig, 'regressao_linear_simples_real_vs_previsto.png')
 
     residuos = y_test - y_pred
     fig, ax = plt.subplots(figsize=(9, 6))
@@ -672,35 +786,39 @@ def run_simple_linear_regression(df_agg, dataset_info):
 
     _log_metrics('Regressao Linear Simples', [
         *dataset_info,
-        f'Registros totais (agregado): {len(df_agg)}',
-        f'Removidos por NaN em features/alvo: {removidos}',
+        f'Registros totais de casos preparados: {len(X_cases)}',
+        f'Registros usados apos filtro 0-60 dias: {len(df_clean)}',
+        f'Removidos por NaN/filtro de atraso: {removidos}',
         f'Treino: {len(X_train)} | Teste: {len(X_test)}',
-        'Modelo: y = total_casos ~ mes_indice',
+        'Modelo: dias_ate_notificacao ~ idade_anos',
         f'Intercepto: {model.intercept_:.4f}',
-        f'Coeficiente (mes_indice): {model.coef_[0]:.4f}',
+        f'Coeficiente (idade_anos): {model.coef_[0]:.4f}',
         f'R2 (teste): {r2:.4f}',
         f'MAE (teste): {mae:.4f}',
         f'RMSE (teste): {rmse:.4f}',
     ])
+    return {'modelo': 'Linear simples individual', 'r2': r2, 'mae': mae, 'rmse': rmse}
 
 
-def run_multiple_linear_regression(df_agg, dataset_info):
+def run_multiple_linear_regression(X_cases, dataset_info):
     print('\n[Regressao Linear Multipla] Iniciando treinamento...')
 
-    numeric_features = [
-        'idade_media', 'pct_febre', 'pct_mialgia', 'pct_cefaleia',
-        'pct_vomito', 'pct_nausea', 'pct_hospitaliz',
-    ]
-    categorical_features = ['sg_uf', 'mes']
-    feature_cols = numeric_features + categorical_features
+    numeric_features = ['idade_anos', *REGRESSION_CALENDAR_FEATURES]
+    categorical_features = REGRESSION_CATEGORICAL_FEATURES
+    binary_features = REGRESSION_BINARY_FEATURES
+    feature_cols = numeric_features + categorical_features + binary_features
 
-    df_clean = df_agg.dropna(subset=['total_casos'] + numeric_features).copy()
+    df_clean = X_cases.dropna(subset=['dias_ate_notificacao'] + feature_cols).copy()
+    df_clean = df_clean[
+        (df_clean['dias_ate_notificacao'] >= 0) &
+        (df_clean['dias_ate_notificacao'] <= 60)
+    ].copy()
     for col in categorical_features:
         df_clean[col] = df_clean[col].fillna('IGN').astype(str)
-    removidos = len(df_agg) - len(df_clean)
+    removidos = len(X_cases) - len(df_clean)
 
     X = df_clean[feature_cols].copy()
-    y = df_clean['total_casos'].values
+    y = df_clean['dias_ate_notificacao'].values
 
     X_train, X_test, y_train, y_test = _split_regression(X, y)
 
@@ -713,21 +831,41 @@ def run_multiple_linear_regression(df_agg, dataset_info):
         ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=True)),
     ])
     preprocessor = ColumnTransformer([
-        ('num', numeric_pipeline, numeric_features),
+        ('num', numeric_pipeline, numeric_features + binary_features),
         ('cat', categorical_pipeline, categorical_features),
     ])
 
     pipe_ols = Pipeline([('pre', preprocessor), ('lr', LinearRegression())])
-    pipe_ridge = Pipeline([
-        ('pre', preprocessor),
-        ('lr', Ridge(alpha=1.0, random_state=SEED)),
-    ])
 
     pipe_ols.fit(X_train, y_train)
-    pipe_ridge.fit(X_train, y_train)
 
     y_pred_ols = pipe_ols.predict(X_test)
-    y_pred_ridge = pipe_ridge.predict(X_test)
+
+    X_train_trans = _to_dense_if_needed(pipe_ols.named_steps['pre'].transform(X_train))
+    X_test_trans = _to_dense_if_needed(pipe_ols.named_steps['pre'].transform(X_test))
+
+    alphas = [0, 0.01, 0.05, 0.1, 1, 10, 50, 100]
+    resultados = []
+    ridge_models = {}
+    for alpha in alphas:
+        ridge = Ridge(alpha=alpha, random_state=SEED)
+        ridge.fit(X_train_trans, y_train)
+        y_pred_alpha = ridge.predict(X_test_trans)
+        resultados.append({
+            'alpha': alpha,
+            'r2': r2_score(y_test, y_pred_alpha),
+            'rmse': np.sqrt(mean_squared_error(y_test, y_pred_alpha)),
+            'norma_beta': np.sum(ridge.coef_ ** 2),
+        })
+        ridge_models[alpha] = ridge
+
+    resultados_df = pd.DataFrame(resultados)
+    _save_csv(resultados_df, 'resultados_regressao_multipla.csv')
+
+    melhor_linha = resultados_df.loc[resultados_df['r2'].idxmax()]
+    melhor_alpha = melhor_linha['alpha']
+    ridge_final = ridge_models[melhor_alpha]
+    y_pred_ridge = ridge_final.predict(X_test_trans)
 
     r2_ols = r2_score(y_test, y_pred_ols)
     r2_ridge = r2_score(y_test, y_pred_ridge)
@@ -738,16 +876,44 @@ def run_multiple_linear_regression(df_agg, dataset_info):
     rmse_ols = np.sqrt(mean_squared_error(y_test, y_pred_ols))
 
     print(f'  OLS R2={r2_ols:.4f}  R2_adj={r2_adj_ols:.4f}  MAE={mae_ols:.2f}  RMSE={rmse_ols:.2f}')
-    print(f'  Ridge R2={r2_ridge:.4f}')
+    print(f'  Ridge melhor alpha={melhor_alpha:g}  R2={r2_ridge:.4f}  RMSE={melhor_linha["rmse"]:.2f}')
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(resultados_df['alpha'].astype(str), resultados_df['r2'], marker='o', linewidth=2)
+    ax.set_title('Evolucao do R2 com Ridge')
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('R2')
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    _save_figure(fig, 'ridge_alpha_r2.png')
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(resultados_df['alpha'].astype(str), resultados_df['rmse'], marker='o', linewidth=2)
+    ax.set_title('Evolucao do RMSE com Ridge')
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('RMSE')
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    _save_figure(fig, 'ridge_alpha_rmse.png')
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(resultados_df['alpha'].astype(str), resultados_df['norma_beta'], color='steelblue')
+    ax.set_title('Evolucao de |beta|^2 com Ridge')
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('|beta|^2')
+    ax.set_yscale('log')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    _save_figure(fig, 'ridge_alpha_norma_beta.png')
 
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.scatter(y_test, y_pred_ols, alpha=0.5, color='steelblue')
     lim_min = min(y_test.min(), y_pred_ols.min())
     lim_max = max(y_test.max(), y_pred_ols.max())
     ax.plot([lim_min, lim_max], [lim_min, lim_max], 'k--', lw=1)
-    ax.set_xlabel('Total de casos (real)')
-    ax.set_ylabel('Total de casos (previsto OLS)')
-    ax.set_title(f'Regressao Multipla: Real vs Previsto (R2={r2_ols:.3f})')
+    ax.set_xlabel('Dias ate notificacao (real)')
+    ax.set_ylabel('Dias ate notificacao (previsto OLS)')
+    ax.set_title(f'Atraso de notificacao: Real vs Previsto (R2={r2_ols:.3f})')
     ax.grid(alpha=0.3)
     plt.tight_layout()
     _save_figure(fig, 'regressao_multipla_real_vs_previsto.png')
@@ -766,6 +932,12 @@ def run_multiple_linear_regression(df_agg, dataset_info):
     try:
         feature_names = pipe_ols.named_steps['pre'].get_feature_names_out()
         coefs = pipe_ols.named_steps['lr'].coef_
+        coeficientes_ridge = pd.DataFrame({
+            'Variavel': feature_names,
+            'Coeficiente': ridge_final.coef_,
+        }).sort_values('Coeficiente', key=abs, ascending=False)
+        _save_csv(coeficientes_ridge, 'coeficientes_regressao_multipla.csv')
+
         top = pd.DataFrame({'feature': feature_names, 'coef': coefs})
         top['abs_coef'] = top['coef'].abs()
         top = top.sort_values('abs_coef', ascending=False).head(15).sort_values('coef')
@@ -783,16 +955,154 @@ def run_multiple_linear_regression(df_agg, dataset_info):
 
     _log_metrics('Regressao Linear Multipla', [
         *dataset_info,
-        f'Registros totais (agregado): {len(df_agg)}',
-        f'Removidos por NaN em features/alvo: {removidos}',
+        f'Registros totais de casos preparados: {len(X_cases)}',
+        f'Registros usados apos filtro 0-60 dias: {len(df_clean)}',
+        f'Removidos por NaN/filtro de atraso: {removidos}',
         f'Treino: {len(X_train)} | Teste: {len(X_test)}',
         f'Features: {feature_cols}',
-        'Modelos: LinearRegression e Ridge(alpha=1.0)',
+        f'Modelos: LinearRegression e Ridge(alpha melhor={melhor_alpha:g})',
         f'R2 OLS (teste): {r2_ols:.4f}',
         f'R2 ajustado OLS: {r2_adj_ols:.4f}',
         f'MAE OLS: {mae_ols:.4f}',
         f'RMSE OLS: {rmse_ols:.4f}',
         f'R2 Ridge (teste): {r2_ridge:.4f}',
+        f'RMSE Ridge (teste): {melhor_linha["rmse"]:.4f}',
+        'Resultados Ridge por alpha salvos em graficos/resultados_regressao_multipla.csv',
+        'Coeficientes Ridge salvos em graficos/coeficientes_regressao_multipla.csv',
+    ])
+    return [
+        {'modelo': 'Linear multipla individual', 'r2': r2_ols, 'mae': mae_ols, 'rmse': rmse_ols},
+        {'modelo': 'Ridge individual', 'r2': r2_ridge, 'mae': mean_absolute_error(y_test, y_pred_ridge), 'rmse': melhor_linha['rmse']},
+    ]
+
+
+def run_weekly_aggregate_ridge_regression(X_cases, dataset_info):
+    print('\n[Ridge Agregado UF/Semana] Iniciando treinamento...')
+
+    symptom_features = ['febre', 'mialgia', 'cefaleia', 'vomito', 'nausea']
+    needed = ['dias_ate_notificacao', 'idade_anos', 'hospitaliz_num', 'sg_uf_not', 'sem_not', *symptom_features]
+    df = X_cases.dropna(subset=needed).copy()
+    df = df[(df['dias_ate_notificacao'] >= 0) & (df['dias_ate_notificacao'] <= 60)].copy()
+    df['sem_not'] = pd.to_numeric(df['sem_not'], errors='coerce')
+    df = df.dropna(subset=['sem_not'])
+    df['semana_epidemiologica'] = (df['sem_not'].astype(int) % 100).astype(int)
+
+    grouped = df.groupby(['sg_uf_not', 'sem_not', 'semana_epidemiologica']).agg(
+        atraso_medio=('dias_ate_notificacao', 'mean'),
+        total_casos=('dias_ate_notificacao', 'size'),
+        idade_media=('idade_anos', 'mean'),
+        pct_hospitaliz=('hospitaliz_num', 'mean'),
+        pct_febre=('febre', 'mean'),
+        pct_mialgia=('mialgia', 'mean'),
+        pct_cefaleia=('cefaleia', 'mean'),
+        pct_vomito=('vomito', 'mean'),
+        pct_nausea=('nausea', 'mean'),
+    ).reset_index()
+
+    pct_cols = ['pct_hospitaliz', 'pct_febre', 'pct_mialgia', 'pct_cefaleia', 'pct_vomito', 'pct_nausea']
+    grouped[pct_cols] = grouped[pct_cols] * 100
+    grouped['semana_sin'] = np.sin(2 * np.pi * grouped['semana_epidemiologica'] / 53)
+    grouped['semana_cos'] = np.cos(2 * np.pi * grouped['semana_epidemiologica'] / 53)
+
+    numeric_features = [
+        'total_casos', 'idade_media', 'pct_hospitaliz', 'pct_febre', 'pct_mialgia',
+        'pct_cefaleia', 'pct_vomito', 'pct_nausea', 'semana_sin', 'semana_cos',
+    ]
+    categorical_features = ['sg_uf_not']
+    X = grouped[numeric_features + categorical_features]
+    y = grouped['atraso_medio'].values
+
+    X_train, X_test, y_train, y_test = _split_regression(X, y)
+    preprocessor = ColumnTransformer([
+        ('num', Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler()),
+        ]), numeric_features),
+        ('cat', Pipeline([
+            ('imputer', SimpleImputer(strategy='most_frequent')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=True)),
+        ]), categorical_features),
+    ])
+
+    X_train_trans = _to_dense_if_needed(preprocessor.fit_transform(X_train))
+    X_test_trans = _to_dense_if_needed(preprocessor.transform(X_test))
+
+    alphas = [0.01, 0.05, 0.1, 1, 10, 50, 100]
+    resultados = []
+    models = {}
+    for alpha in alphas:
+        model = Ridge(alpha=alpha, random_state=SEED)
+        model.fit(X_train_trans, y_train)
+        y_pred_alpha = model.predict(X_test_trans)
+        resultados.append({
+            'alpha': alpha,
+            'r2': r2_score(y_test, y_pred_alpha),
+            'mae': mean_absolute_error(y_test, y_pred_alpha),
+            'rmse': np.sqrt(mean_squared_error(y_test, y_pred_alpha)),
+        })
+        models[alpha] = model
+
+    resultados_df = pd.DataFrame(resultados)
+    _save_csv(resultados_df, 'resultados_ridge_agregado_uf_semana.csv')
+    melhor = resultados_df.loc[resultados_df['r2'].idxmax()]
+    y_pred = models[melhor['alpha']].predict(X_test_trans)
+
+    print(f'  Ridge agregado melhor alpha={melhor["alpha"]:g}  R2={melhor["r2"]:.4f}  MAE={melhor["mae"]:.2f}  RMSE={melhor["rmse"]:.2f}')
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.scatter(y_test, y_pred, alpha=0.6, color='steelblue')
+    lim_min = min(y_test.min(), y_pred.min())
+    lim_max = max(y_test.max(), y_pred.max())
+    ax.plot([lim_min, lim_max], [lim_min, lim_max], 'k--', lw=1)
+    ax.set_xlabel('Atraso medio real (dias)')
+    ax.set_ylabel('Atraso medio previsto (dias)')
+    ax.set_title(f'Ridge agregado UF/Semana: Real vs Previsto (R2={melhor["r2"]:.3f})')
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    _save_figure(fig, 'ridge_agregado_uf_semana_real_vs_previsto.png')
+
+    _log_metrics('Ridge Agregado UF/Semana', [
+        *dataset_info,
+        f'Registros de casos usados apos filtro 0-60 dias: {len(df)}',
+        f'Grupos UF/semana usados: {len(grouped)}',
+        f'Treino: {len(X_train)} | Teste: {len(X_test)}',
+        f'Features numericas: {numeric_features}',
+        f'Features categoricas: {categorical_features}',
+        f'Melhor alpha: {melhor["alpha"]:g}',
+        f'R2 (teste): {melhor["r2"]:.4f}',
+        f'MAE (teste): {melhor["mae"]:.4f}',
+        f'RMSE (teste): {melhor["rmse"]:.4f}',
+    ])
+    return {'modelo': 'Ridge agregado UF/semana', 'r2': melhor['r2'], 'mae': melhor['mae'], 'rmse': melhor['rmse']}
+
+
+def _build_comparativo_regressao(regression_results):
+    print('\n[Comparativo Regressao] Gerando comparativo dos modelos de atraso...')
+    df_cmp = pd.DataFrame(regression_results)
+    print('\n  Tabela final - Regressao (atraso de notificacao):')
+    print(df_cmp.to_string(index=False))
+    _save_csv(df_cmp, 'comparativo_regressao_atraso.csv')
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    metricas = ['r2', 'mae', 'rmse']
+    x = np.arange(len(metricas))
+    width = 0.18
+    for i, row in df_cmp.iterrows():
+        vals = [row[m] for m in metricas]
+        ax.bar(x + (i - len(df_cmp) / 2) * width, vals, width, label=row['modelo'])
+    ax.set_xticks(x)
+    ax.set_xticklabels(['R2', 'MAE', 'RMSE'])
+    ax.set_title('Comparativo de regressao: atraso de notificacao')
+    ax.grid(axis='y', alpha=0.3)
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    _save_figure(fig, 'comparativo_regressao_atraso.png')
+
+    _log_metrics('Comparativo Regressao - Atraso de Notificacao', [
+        df_cmp.to_string(index=False),
+        'Melhor R2: ' + df_cmp.sort_values('r2', ascending=False).iloc[0]['modelo'],
+        'Menor MAE: ' + df_cmp.sort_values('mae').iloc[0]['modelo'],
+        'Menor RMSE: ' + df_cmp.sort_values('rmse').iloc[0]['modelo'],
     ])
 
 
@@ -852,8 +1162,11 @@ def run_ml_models():
     if METRICAS_FILE.exists():
         METRICAS_FILE.unlink()
 
+    allowed_years_text = ', '.join(map(str, ALLOWED_DATA_YEARS))
+    print(f'\nModelos limitados aos anos: {allowed_years_text}')
+
     total_raw = fetch_total_record_count()
-    print(f'\nTotal de registros brutos no MySQL: {total_raw}')
+    print(f'\nTotal de registros brutos no MySQL ({allowed_years_text}): {total_raw}')
 
     df_cases = fetch_case_modeling_dataframe_sampled()
     print(
@@ -866,7 +1179,8 @@ def run_ml_models():
     for line in case_log:
         print(f'  {line}')
     _log_metrics('Preparacao - Dados por caso', [
-        f'Total bruto no MySQL: {total_raw}',
+        f'Anos usados nos modelos: {allowed_years_text}',
+        f'Total bruto no MySQL ({allowed_years_text}): {total_raw}',
         f'Amostra SQL carregada: {len(df_cases)}',
         f'Limite de positivos na amostra: {CASE_SAMPLE_POSITIVE_LIMIT}',
         f'Limite de negativos na amostra: {CASE_SAMPLE_NEGATIVE_LIMIT}',
@@ -884,16 +1198,19 @@ def run_ml_models():
     _log_metrics('Preparacao - Agregado mensal', agg_log)
 
     dataset_info = [
-        f'Total de registros brutos do MySQL: {total_raw}',
+        f'Anos usados nos modelos: {allowed_years_text}',
+        f'Total de registros brutos do MySQL ({allowed_years_text}): {total_raw}',
         f'Amostra de classificacao carregada: {len(df_cases)}',
     ]
 
     knn_resultado = run_knn_model(X, y, dataset_info)
     logistica_resultado = run_logistic_regression_model(X, y, dataset_info)
-    run_simple_linear_regression(df_agg, dataset_info)
-    run_multiple_linear_regression(df_agg, dataset_info)
+    regression_results = [run_simple_linear_regression(X, dataset_info)]
+    regression_results.extend(run_multiple_linear_regression(X, dataset_info))
+    regression_results.append(run_weekly_aggregate_ridge_regression(X, dataset_info))
 
     _build_comparativo_classificacao(knn_resultado, logistica_resultado)
+    _build_comparativo_regressao(regression_results)
 
     print('\nModelos concluidos. Saidas em graficos/ e metricas_modelos.txt.')
 

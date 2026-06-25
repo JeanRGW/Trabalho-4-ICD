@@ -11,7 +11,7 @@ from zipfile import ZipFile
 
 DATASET_PAGE_URL = "https://dados.gov.br/dados/conjuntos-dados/arboviroses-dengue"
 DEFAULT_STATE_FILE = Path("resource_monitor_state.json")
-MIN_RESOURCE_YEAR = 2017
+MIN_RESOURCE_YEAR = 2024
 S3_CSV_URL_TEMPLATE = (
     "https://s3.sa-east-1.amazonaws.com/ckan.saude.gov.br/SINAN/Dengue/csv/DENGBR{year_short}.csv.zip"
 )

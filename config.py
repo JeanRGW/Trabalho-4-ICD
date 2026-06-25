@@ -10,6 +10,8 @@ DB_CONFIG = {
     'collation': 'utf8mb4_unicode_ci'
 }
 
+ALLOWED_DATA_YEARS = (2024, 2025)
+
 def get_connection():
     try:
         connection = mysql.connector.connect(**DB_CONFIG)
